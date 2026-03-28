@@ -220,6 +220,59 @@ impl MiniProjection {
         (keys, n_tokens)
     }
 
+    /// Produce Q vectors WITHOUT RoPE — for position-free content-addressable retrieval.
+    ///
+    /// Returns flat f32 of shape `[n_tokens, n_heads, head_dim]`.
+    /// No positional encoding — dot products are purely content-based.
+    pub fn encode_query_no_rope(&self, text: &str) -> Vec<f32> {
+        let tokens = self.tokenizer.encode(text, false);
+        let c = &self.config;
+        let mut all_q = Vec::with_capacity(tokens.len() * c.n_heads * c.head_dim);
+
+        for &token_id in &tokens {
+            let embed = self.get_embedding(token_id as usize);
+            let normed = self.input_norm.forward(&embed);
+            let mut q = matmul(&self.q_weights, &normed, c.n_heads * c.head_dim);
+            if let Some(bias) = &self.q_bias {
+                for (v, b) in q.iter_mut().zip(bias.iter()) {
+                    *v += b;
+                }
+            }
+            all_q.extend_from_slice(&q);
+        }
+
+        all_q
+    }
+
+    /// Produce K vectors WITHOUT RoPE — for position-free memory storage.
+    ///
+    /// Returns `(keys, n_tokens)` where keys are pre-RoPE.
+    /// These vectors are smoother (no high-frequency RoPE oscillations),
+    /// so TurboQuant compression quality should be higher.
+    pub fn encode_kv_no_rope(&self, text: &str) -> (Vec<Vec<f32>>, usize) {
+        let tokens = self.tokenizer.encode(text, false);
+        let c = &self.config;
+        let n_tokens = tokens.len();
+        let kv_dim = c.n_kv_heads * c.head_dim;
+
+        let mut keys = Vec::with_capacity(n_tokens);
+
+        for &token_id in &tokens {
+            let embed = self.get_embedding(token_id as usize);
+            let normed = self.input_norm.forward(&embed);
+            let mut k = matmul(&self.k_weights, &normed, kv_dim);
+            if let Some(bias) = &self.k_bias {
+                for (v, b) in k.iter_mut().zip(bias.iter()) {
+                    *v += b;
+                }
+            }
+            // No RoPE — store raw projection.
+            keys.push(k);
+        }
+
+        (keys, n_tokens)
+    }
+
     /// Number of tokens a text would produce.
     pub fn token_count(&self, text: &str) -> usize {
         self.tokenizer.encode(text, false).len()

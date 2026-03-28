@@ -193,6 +193,44 @@ impl PositionMap {
         self.spans.last().map_or(0, |s| s.end_pos)
     }
 
+    /// Drain and return all spans whose `end_pos <= end_pos`.
+    ///
+    /// Spans are removed from the front (oldest first). Returns the drained spans.
+    pub fn drain_up_to(&mut self, end_pos: usize) -> Vec<Span> {
+        // Find the split point: first span whose end_pos > end_pos.
+        let split = self.spans.iter().position(|s| s.end_pos > end_pos)
+            .unwrap_or(self.spans.len());
+        self.spans.drain(..split).collect()
+    }
+
+    /// Clear all spans.
+    pub fn clear(&mut self) {
+        self.spans.clear();
+    }
+
+    /// Shift all positions by `-offset` (for L1 compaction after drain).
+    ///
+    /// Spans that start before offset are truncated: their start_pos becomes 0
+    /// and their text is preserved (it's the best we have). Spans fully below
+    /// offset are removed.
+    pub fn rebase(&mut self, offset: usize) {
+        self.spans.retain_mut(|span| {
+            if span.end_pos <= offset {
+                // Fully below offset — remove.
+                return false;
+            }
+            if span.start_pos < offset {
+                // Partially overlapping — truncate start.
+                span.start_pos = 0;
+                span.end_pos -= offset;
+            } else {
+                span.start_pos -= offset;
+                span.end_pos -= offset;
+            }
+            true
+        });
+    }
+
     // -- Internal --
 
     fn span_index_at(&self, pos: usize) -> Option<usize> {
@@ -334,6 +372,69 @@ mod tests {
         assert_eq!(map.next_turn_id(), 0);
         assert_eq!(map.next_turn_id(), 1);
         assert_eq!(map.next_turn_id(), 2);
+    }
+
+    #[test]
+    fn drain_up_to_removes_old_spans() {
+        let mut map = make_map();
+        // Spans: [0,10), [10,25), [25,35), [35,60)
+        // Drain everything with end_pos <= 25.
+        let drained = map.drain_up_to(25);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].start_pos, 0);
+        assert_eq!(drained[1].end_pos, 25);
+        assert_eq!(map.len(), 2); // two spans remain
+        assert_eq!(map.spans()[0].start_pos, 25);
+    }
+
+    #[test]
+    fn drain_up_to_none() {
+        let mut map = make_map();
+        let drained = map.drain_up_to(0);
+        assert!(drained.is_empty());
+        assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn drain_up_to_all() {
+        let mut map = make_map();
+        let drained = map.drain_up_to(100);
+        assert_eq!(drained.len(), 4);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn rebase_shifts_positions() {
+        let mut map = make_map();
+        // Drain first two spans, then rebase remaining.
+        let _ = map.drain_up_to(25);
+        map.rebase(25);
+        assert_eq!(map.spans()[0].start_pos, 0);
+        assert_eq!(map.spans()[0].end_pos, 10); // was [25,35)
+        assert_eq!(map.spans()[1].start_pos, 10);
+        assert_eq!(map.spans()[1].end_pos, 35); // was [35,60)
+    }
+
+    #[test]
+    fn rebase_truncates_partial_spans() {
+        let mut map = PositionMap::new();
+        let turn = map.next_turn_id();
+        map.append(0, 16, "big span".into(), Role::User, Some(turn), None);
+
+        // Rebase by 4: span [0,16) becomes [0,12) with text preserved.
+        map.rebase(4);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.spans()[0].start_pos, 0);
+        assert_eq!(map.spans()[0].end_pos, 12);
+        assert_eq!(map.spans()[0].text, "big span");
+    }
+
+    #[test]
+    fn clear_empties_map() {
+        let mut map = make_map();
+        map.clear();
+        assert!(map.is_empty());
+        assert_eq!(map.total_positions(), 0);
     }
 
     #[test]

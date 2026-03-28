@@ -5,9 +5,15 @@ edition = "2024"
 description = "Neural associative memory engine — attention-driven retrieval over compressed KV stores"
 license = "MIT"
 
+[features]
+default = ["gpu"]
+gpu = ["wgpu", "pollster"]
+
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
 ternary-rs = { path = "../ternary-rs" }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]

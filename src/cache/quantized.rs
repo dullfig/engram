@@ -51,6 +51,24 @@ pub struct QuantizedKvCache {
     len: usize,
 }
 
+/// Raw compressed data for a single (position, head) entry.
+///
+/// Used for zero-loss tier migration — copy bytes between caches
+/// without dequant/requant error accumulation.
+#[derive(Debug, Clone)]
+pub struct CompressedEntry {
+    /// Quantized angle indices for K (length: head_dim/2).
+    pub k_angles: Vec<u8>,
+    /// Quantized angle indices for V (length: head_dim/2).
+    pub v_angles: Vec<u8>,
+    /// K radius scale.
+    pub k_radius: f32,
+    /// V radius scale.
+    pub v_radius: f32,
+    /// Optional QJL sign bits (k_signs, v_signs).
+    pub qjl_signs: Option<(Vec<u8>, Vec<u8>)>,
+}
+
 impl QuantizedKvCache {
     /// Create a new compressed cache for one layer (PolarQuant only, no QJL).
     pub fn new(n_kv_heads: usize, head_dim: usize, max_seq_len: usize, seed: u64) -> Self {
@@ -245,9 +263,118 @@ impl QuantizedKvCache {
         out
     }
 
+    /// Dequantize the K vector at (pos, head) back to f32.
+    ///
+    /// Returns a Vec<f32> of length head_dim in original (non-rotated) space.
+    pub fn key_at_dequant(&self, pos: usize, kv_head: usize) -> Vec<f32> {
+        debug_assert!(pos < self.len);
+        debug_assert!(kv_head < self.n_kv_heads);
+
+        let n_pairs = self.head_dim / 2;
+        let angle_off = (pos * self.n_kv_heads + kv_head) * n_pairs;
+        let radius = self.k_radius[pos * self.n_kv_heads + kv_head];
+        let angles = &self.k_angles[angle_off..angle_off + n_pairs];
+
+        let rotated = polar::from_polar_quantized(angles, radius, &self.lut);
+
+        let mut out = vec![0.0f32; self.head_dim];
+        polar::rotate_transpose(&self.rotation_matrix, &rotated, &mut out);
+        out
+    }
+
+    /// Remaining capacity (positions that can still be appended).
+    pub fn remaining(&self) -> usize {
+        self.max_seq_len - self.len
+    }
+
+    /// Read compressed data for a single (pos, head) entry — zero-loss tier migration.
+    pub fn read_compressed_k(&self, pos: usize, head: usize) -> CompressedEntry {
+        debug_assert!(pos < self.len);
+        debug_assert!(head < self.n_kv_heads);
+
+        let n_pairs = self.head_dim / 2;
+        let angle_off = (pos * self.n_kv_heads + head) * n_pairs;
+        let radius_off = pos * self.n_kv_heads + head;
+
+        let k_angles = self.k_angles[angle_off..angle_off + n_pairs].to_vec();
+        let v_angles = self.v_angles[angle_off..angle_off + n_pairs].to_vec();
+        let k_radius = self.k_radius[radius_off];
+        let v_radius = self.v_radius[radius_off];
+
+        let qjl_signs = if let (Some(qjl), Some(k_signs), Some(v_signs)) =
+            (&self.qjl, &self.k_qjl_signs, &self.v_qjl_signs)
+        {
+            let sb = qjl.sign_bytes();
+            let sign_off = (pos * self.n_kv_heads + head) * sb;
+            Some((
+                k_signs[sign_off..sign_off + sb].to_vec(),
+                v_signs[sign_off..sign_off + sb].to_vec(),
+            ))
+        } else {
+            None
+        };
+
+        CompressedEntry {
+            k_angles,
+            v_angles,
+            k_radius,
+            v_radius,
+            qjl_signs,
+        }
+    }
+
+    /// Append a compressed entry directly — zero-loss tier migration (no dequant/requant).
+    pub fn append_compressed(&mut self, entry: &CompressedEntry, head: usize) {
+        debug_assert!(head < self.n_kv_heads);
+        assert!(self.len < self.max_seq_len, "cache overflow");
+
+        let n_pairs = self.head_dim / 2;
+        debug_assert_eq!(entry.k_angles.len(), n_pairs);
+
+        let pos = self.len;
+        let angle_off = (pos * self.n_kv_heads + head) * n_pairs;
+        let radius_off = pos * self.n_kv_heads + head;
+
+        self.k_angles[angle_off..angle_off + n_pairs].copy_from_slice(&entry.k_angles);
+        self.v_angles[angle_off..angle_off + n_pairs].copy_from_slice(&entry.v_angles);
+        self.k_radius[radius_off] = entry.k_radius;
+        self.v_radius[radius_off] = entry.v_radius;
+
+        if let (Some(qjl), Some(k_signs), Some(v_signs), Some((ek, ev))) = (
+            &self.qjl,
+            &mut self.k_qjl_signs,
+            &mut self.v_qjl_signs,
+            &entry.qjl_signs,
+        ) {
+            let sb = qjl.sign_bytes();
+            let sign_off = (pos * self.n_kv_heads + head) * sb;
+            k_signs[sign_off..sign_off + sb].copy_from_slice(ek);
+            v_signs[sign_off..sign_off + sb].copy_from_slice(ev);
+        }
+    }
+
+    /// Advance len by 1 — call after appending compressed entries for ALL heads at a position.
+    pub fn advance_len(&mut self) {
+        assert!(self.len < self.max_seq_len, "cache overflow");
+        self.len += 1;
+    }
+
     /// Reset the cache (reuse allocations).
     pub fn clear(&mut self) {
         self.len = 0;
+    }
+
+    /// Raw K angle bytes slice — for GPU upload.
+    pub fn k_angles_slice(&self) -> &[u8] {
+        let n_pairs = self.head_dim / 2;
+        let used = self.len * self.n_kv_heads * n_pairs;
+        &self.k_angles[..used]
+    }
+
+    /// Raw K radius slice — for GPU upload.
+    pub fn k_radius_slice(&self) -> &[f32] {
+        let used = self.len * self.n_kv_heads;
+        &self.k_radius[..used]
     }
 
     /// Memory usage in bytes (compressed storage only, excludes rotation matrix).
@@ -379,6 +506,61 @@ mod tests {
         cache.append_one(&vec![1.0; kv_dim], &vec![2.0; kv_dim]);
         cache.append_one(&vec![1.0; kv_dim], &vec![2.0; kv_dim]);
         cache.append_one(&vec![1.0; kv_dim], &vec![2.0; kv_dim]); // 3 > 2
+    }
+
+    #[test]
+    fn key_at_dequant_roundtrip() {
+        let mut cache = QuantizedKvCache::new(2, 8, 100, 42);
+        let kv_dim = 2 * 8;
+        // Use varied values so the key isn't degenerate.
+        let key: Vec<f32> = (0..kv_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let value = vec![0.3f32; kv_dim];
+        cache.append_one(&key, &value);
+
+        let k = cache.key_at_dequant(0, 0);
+        assert_eq!(k.len(), 8);
+        for &val in &k {
+            assert!(val.is_finite());
+        }
+        // Quantization loses precision, but the direction should be roughly preserved.
+        let norm: f32 = k.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!(norm > 0.0, "dequantized key should be nonzero");
+    }
+
+    #[test]
+    fn compressed_entry_roundtrip() {
+        let mut src = QuantizedKvCache::new(2, 8, 100, 42);
+        let kv_dim = 2 * 8;
+        let key: Vec<f32> = (0..kv_dim).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let value = vec![0.3f32; kv_dim];
+        src.append_one(&key, &value);
+
+        // Read compressed, write to a fresh cache.
+        let mut dst = QuantizedKvCache::new(2, 8, 100, 42);
+        for head in 0..2 {
+            let entry = src.read_compressed_k(0, head);
+            dst.append_compressed(&entry, head);
+        }
+        dst.advance_len();
+
+        assert_eq!(dst.len(), 1);
+
+        // Verify the K dot product matches between src and dst.
+        let query = vec![1.0f32; 8];
+        let dot_src = src.dot_key(0, 0, &query);
+        let dot_dst = dst.dot_key(0, 0, &query);
+        assert!(
+            (dot_src - dot_dst).abs() < 1e-6,
+            "compressed roundtrip should be lossless: {dot_src} vs {dot_dst}"
+        );
+    }
+
+    #[test]
+    fn remaining_capacity() {
+        let mut cache = QuantizedKvCache::new(1, 4, 5, 42);
+        assert_eq!(cache.remaining(), 5);
+        cache.append_one(&vec![1.0; 4], &vec![2.0; 4]);
+        assert_eq!(cache.remaining(), 4);
     }
 
     #[test]
