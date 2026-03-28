@@ -144,7 +144,7 @@ impl PositionMap {
     ///
     /// Multiple positions within the same span are summed. Returns
     /// spans sorted by descending aggregated score.
-    pub fn resolve_top_k(&self, positions: &[(usize, f32)]) -> Vec<ResolvedSpan> {
+    pub fn resolve_top_k(&self, positions: &[(usize, f32)]) -> Vec<ResolvedSpan<'_>> {
         // Aggregate scores by span index.
         let mut span_scores: Vec<f32> = vec![0.0; self.spans.len()];
 

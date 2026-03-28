@@ -29,6 +29,7 @@
 //! - [`retrieve`] — Attention-based retrieval API
 
 pub mod cache;
+pub mod engine;
 pub mod ops;
 pub mod projection;
 pub mod retrieve;
