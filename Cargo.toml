@@ -8,5 +8,6 @@ license = "MIT"
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
+ternary-rs = { path = "../ternary-rs" }
 
 [dev-dependencies]

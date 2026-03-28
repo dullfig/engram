@@ -30,4 +30,5 @@
 
 pub mod cache;
 pub mod ops;
+pub mod projection;
 pub mod retrieve;
